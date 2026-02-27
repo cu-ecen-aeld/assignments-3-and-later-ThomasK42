@@ -1,4 +1,8 @@
 #include "systemcalls.h"
+#include <unistd.h>
+#include <sys/wait.h>
+#include <stdlib.h>
+#include <fcntl.h>
 
 /**
  * @param cmd the command to execute with system()
@@ -17,7 +21,7 @@ bool do_system(const char *cmd)
  *   or false() if it returned a failure
 */
 
-    return true;
+    return system(cmd) == 0;
 }
 
 /**
@@ -36,6 +40,8 @@ bool do_system(const char *cmd)
 
 bool do_exec(int count, ...)
 {
+    int child_pid;
+    int child_res;
     va_list args;
     va_start(args, count);
     char * command[count+1];
@@ -45,9 +51,6 @@ bool do_exec(int count, ...)
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
-    // this line is to avoid a compile warning before your implementation is complete
-    // and may be removed
-    command[count] = command[count];
 
 /*
  * TODO:
@@ -59,9 +62,24 @@ bool do_exec(int count, ...)
  *
 */
 
+    child_pid = fork();
+    if (child_pid == -1) // error forking
+    {
+        return false;
+    }
+    if (child_pid == 0) // child process
+    {
+        execv(command[0], command);
+        exit(1);
+    }
+
+    if (waitpid(child_pid, &child_res, 0) == -1) {
+        return false;
+    }
+
     va_end(args);
 
-    return true;
+    return child_res == 0;
 }
 
 /**
@@ -71,6 +89,9 @@ bool do_exec(int count, ...)
 */
 bool do_exec_redirect(const char *outputfile, int count, ...)
 {
+    int child_pid;
+    int child_res;
+    int fd;
     va_list args;
     va_start(args, count);
     char * command[count+1];
@@ -80,10 +101,6 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
-    // this line is to avoid a compile warning before your implementation is complete
-    // and may be removed
-    command[count] = command[count];
-
 
 /*
  * TODO
@@ -93,7 +110,37 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *
 */
 
+    fd = open(outputfile, O_WRONLY|O_TRUNC|O_CREAT, 0644);
+    if (fd < 0) 
+    { 
+        return false;
+    }
+
+    child_pid = fork();
+    if (child_pid == -1) // error forking
+    {
+        close(fd);
+        return false;
+    }
+    if (child_pid == 0) // child process
+    {
+        if (dup2(fd, 1) < 0)
+        {
+            return false;
+        }
+        close(fd);
+        execv(command[0], command);
+        exit(1);
+    }
+
+    if (waitpid(child_pid, &child_res, 0) < 0) 
+    {
+        close(fd);
+        return false;
+    }
+
     va_end(args);
 
-    return true;
+    close(fd);
+    return child_res == 0;
 }
