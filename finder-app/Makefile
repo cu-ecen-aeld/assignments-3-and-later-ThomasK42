@@ -8,6 +8,8 @@ else
 	CC := gcc
 endif
 
+all: $(TARGET)
+
 default: $(TARGET)
 
 $(TARGET) : $(OBJS)
