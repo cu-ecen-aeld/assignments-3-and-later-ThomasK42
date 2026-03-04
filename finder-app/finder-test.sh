@@ -66,9 +66,9 @@ rm -rf /tmp/aeld-data
 set +e
 echo ${OUTPUTSTRING} | grep "${MATCHSTR}"
 if [ $? -eq 0 ]; then
-	echo "success" > /tmp/assignment-4-result.txt
+	echo "success" > /tmp/assignment4-result.txt
 	exit 0
 else
-	echo "failed: expected  ${MATCHSTR} in ${OUTPUTSTRING} but instead found" > /tmp/assignment-4-result.txt
+	echo "failed: expected  ${MATCHSTR} in ${OUTPUTSTRING} but instead found" > /tmp/assignment4-result.txt
 	exit 1
 fi
