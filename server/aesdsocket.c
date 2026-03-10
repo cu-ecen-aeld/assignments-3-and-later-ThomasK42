@@ -8,12 +8,109 @@
 #include <netinet/in.h> 
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <signal.h> 
+#include <signal.h>
+#include <pthread.h> 
+#include "queue.h"
 
 int sig_catched = -1;
 
 void sig_handler(int signum) {
     sig_catched = signum;
+}
+
+struct client_data {
+    int client_fd;
+    pthread_t thread_id;
+    bool active;
+    bool terminate;
+    SLIST_ENTRY(client_data) entries;
+};
+
+FILE *output_file;
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER; 
+
+void* client_thread(void *arg) {
+    struct client_data* data = (struct client_data *)arg;
+
+    do
+    {
+        size_t buf_size = 1024;
+        char *recvbuf = malloc(buf_size+1);
+        size_t total_len = 0;
+        ssize_t recv_len;
+        while ((recv_len = recv(data->client_fd, recvbuf+total_len, buf_size-total_len, 0)) > 0) {
+            total_len += recv_len;
+            recvbuf[total_len] = '\0';
+            if (recvbuf[total_len-1] == '\n') {
+                break;
+            }
+            if (total_len == buf_size) {
+                buf_size *= 2;
+                char *new_buf = realloc(recvbuf, buf_size+1);
+                if (new_buf == NULL) {
+                    syslog(LOG_ERR, "Error %s reallocating buffer", strerror(errno));
+                    free(recvbuf);
+                    exit(1);   
+                }
+                recvbuf = new_buf;  
+            }               
+        }
+        if (recv_len == -1) {
+            syslog(LOG_ERR, "Error %s receiving data", strerror(errno));
+            free(recvbuf);
+            data->active = false;
+        }
+        else if (recv_len == 0) {
+            syslog(LOG_DEBUG, "Received no data");
+            free(recvbuf);
+            data->active = false;
+        }
+        else {    
+            syslog(LOG_DEBUG, "Received data: %s", recvbuf);
+            pthread_mutex_lock(&file_mutex);
+            fputs(recvbuf, output_file);
+            fflush(output_file);
+            free(recvbuf);
+
+            char sendbuf[1024];
+            fseek(output_file, 0, SEEK_SET);
+            while (fgets(sendbuf, sizeof(sendbuf), output_file) != NULL) {
+                syslog(LOG_DEBUG, "Sending data: %s", sendbuf);
+                ssize_t result = send(data->client_fd, sendbuf, strlen(sendbuf), 0);
+                if (result == -1) {
+                    syslog(LOG_ERR, "Error %s sending data", strerror(errno));
+                    data->active = false;
+                    break;
+                }
+                if (result != (ssize_t) strlen(sendbuf)) {
+                    syslog(LOG_ERR, "Error sending all data");
+                    data->active = false;
+                    break;
+                }
+                syslog(LOG_DEBUG, "Data sent %ld", result);
+            }
+            pthread_mutex_unlock(&file_mutex);
+        }    
+    } while (data->active && !data->terminate);
+
+    syslog(LOG_DEBUG, "Closing connection for socket handle %d", data->client_fd);
+    close(data->client_fd);
+    data->active = false;   
+    return NULL;
+}
+
+void* timer_thread(void *) {
+    while (sig_catched == -1) {
+        sleep(10);
+        time_t now = time(NULL);
+        char time_str[26];
+        ctime_r(&now, time_str);    
+        pthread_mutex_lock(&file_mutex);
+        fprintf(output_file, "timestamp:%s", time_str);
+        fflush(output_file);
+        pthread_mutex_unlock(&file_mutex);
+    }
+    return NULL;
 }
 
 int main(int argc, char *argv[]) {
@@ -22,8 +119,10 @@ int main(int argc, char *argv[]) {
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_addr_len = sizeof(client_addr);    
     bool deamonize = false;
+    SLIST_HEAD(client_list, client_data) clients = SLIST_HEAD_INITIALIZER(clients);
+    pthread_t timer_thread_id;
 
-    openlog("aesdsocket", LOG_PID | LOG_CONS, LOG_USER);
+    openlog("aesdsocket", LOG_PID | LOG_PERROR, LOG_USER);
 
     if (argc > 2) {
         syslog(LOG_ERR, "Usage: %s [-d]\n", argv[0]);
@@ -84,12 +183,17 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    FILE *file = fopen("/var/tmp/aesdsocketdata", "w+");
-    if (file == NULL) {
+    output_file = fopen("/var/tmp/aesdsocketdata", "w+");
+    if (output_file == NULL) {
         syslog(LOG_ERR, "Error %s opening file", strerror(errno));
         return 1;
     }
-    fseek(file, 0, SEEK_END);
+    fseek(output_file, 0, SEEK_END);
+
+    if (pthread_create(&timer_thread_id, NULL, timer_thread, NULL) != 0) {
+        syslog(LOG_ERR, "Error %s creating timer thread", strerror(errno));
+        return 1;
+    }
 
     do
     {
@@ -99,63 +203,60 @@ int main(int argc, char *argv[]) {
                 break;
             }
             syslog(LOG_ERR, "Error %s accepting connection", strerror(errno));
-            return 1;
+            continue;
         }   
-        syslog(LOG_DEBUG, "Accepted connection from %s", inet_ntoa(client_addr.sin_addr));
+        syslog(LOG_DEBUG, "Accepted connection from %s with socket handle %d", inet_ntoa(client_addr.sin_addr), client_fd);
 
-        size_t buf_size = 1024;
-        char *recvbuf = malloc(buf_size+1);
-        size_t total_len = 0;
-        ssize_t recv_len;
-        while ((recv_len = recv(client_fd, recvbuf+total_len, buf_size-total_len, 0)) > 0) {
-            total_len += recv_len;
-            recvbuf[total_len] = '\0';
-            if (recvbuf[total_len-1] == '\n') {
-                break;
-            }
-            if (total_len == buf_size) {
-                buf_size *= 2;
-                char *new_buf = realloc(recvbuf, buf_size+1);
-                if (new_buf == NULL) {
-                    syslog(LOG_ERR, "Error %s reallocating buffer", strerror(errno));
-                    free(recvbuf);
-                    return 1;   
-                }
-                recvbuf = new_buf;  
-            }               
+        struct client_data *data = malloc(sizeof(struct client_data));
+        if (data == NULL) {
+            syslog(LOG_ERR, "Error %s allocating memory for client data", strerror(errno));
+            close(client_fd);
+            continue;
         }
-        syslog(LOG_DEBUG, "Received data: %s", recvbuf);
-        fputs(recvbuf, file);
-        free(recvbuf);
-
-        char sendbuf[1024];
-        fseek(file, 0, SEEK_SET);
-        while (fgets(sendbuf, sizeof(sendbuf), file) != NULL) {
-            syslog(LOG_DEBUG, "Sending data: %s", sendbuf);
-            ssize_t result = send(client_fd, sendbuf, strlen(sendbuf), 0);
-            if (result == -1) {
-                syslog(LOG_ERR, "Error %s sending data", strerror(errno));
-                return 1;
-            }
-            if (result != (ssize_t) strlen(sendbuf)) {
-                syslog(LOG_ERR, "Error sending all data");
-                return 1;
-            }
-            syslog(LOG_DEBUG, "Data sent %ld", result);
+        data->client_fd = client_fd;
+        data->active = true;
+        data->terminate = false;
+        SLIST_INSERT_HEAD(&clients, data, entries);
+        if (pthread_create(&data->thread_id, NULL, client_thread, data) != 0) {
+            syslog(LOG_ERR, "Error %s creating thread for client", strerror(errno));
+            SLIST_REMOVE(&clients, data, client_data, entries);
+            free(data);
+            close(client_fd);
+            continue;
         }
+        syslog(LOG_DEBUG, "Created client thread %ld", data->thread_id);
 
-        close(client_fd);   
-
-        syslog(LOG_DEBUG, "Closed connection from %s", inet_ntoa(client_addr.sin_addr));
-
+        struct client_data *temp;
+        SLIST_FOREACH_SAFE(data, &clients, entries, temp) {
+            if (!data->active) {
+                syslog(LOG_DEBUG, "Terminating client thread %ld", data->thread_id);
+                pthread_join(data->thread_id, NULL);
+                SLIST_REMOVE(&clients, data, client_data, entries);
+                free(data);
+            }    
+        }    
     } while (sig_catched == -1);
 
     syslog(LOG_DEBUG, "Caught signal %d, exiting", sig_catched);
 
-    fclose(file);
+    struct client_data *data, *temp;
+    SLIST_FOREACH_SAFE(data, &clients, entries, temp) {
+        syslog(LOG_DEBUG, "Terminating client thread %ld", data->thread_id);
+        data->terminate = true;
+        pthread_kill(data->thread_id, SIGINT);
+        pthread_join(data->thread_id, NULL);
+        SLIST_REMOVE(&clients, data, client_data, entries);
+        free(data);
+    }
+    pthread_kill(timer_thread_id, SIGINT);
+    pthread_join(timer_thread_id, NULL);
+
+    syslog(LOG_DEBUG, "Done, terminating");
+
+    fclose(output_file);
     close(server_fd);
 
-    unlink("/var/tmp/aesdsocketdata");
+    //unlink("/var/tmp/aesdsocketdata");
 
     return 0;    
 }
