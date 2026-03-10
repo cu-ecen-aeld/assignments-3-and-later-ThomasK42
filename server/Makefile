@@ -1,14 +1,14 @@
 SRC := aesdsocket.c
-TARGET = aesdsocket
+TARGET ?= aesdsocket
 OBJS := $(SRC:.c=.o)
 
 ifdef CROSS_COMPILE
-	CC := $(CROSS_COMPILE)gcc
+	CC ?= $(CROSS_COMPILE)gcc
 else
-	CC := gcc
+	CC ?= gcc
 endif
 
-CFLAGS := -Wall -Wextra -Werror -g
+CFLAGS ?= -Wall -Wextra -Werror -g
 
 all: $(TARGET)
 
